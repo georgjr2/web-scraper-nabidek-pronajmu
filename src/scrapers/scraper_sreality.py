@@ -1,5 +1,6 @@
+import json
 import logging
-from time import time
+import re
 from urllib.parse import urljoin
 
 import requests
@@ -7,10 +8,6 @@ import requests
 from disposition import Disposition
 from scrapers.rental_offer import RentalOffer
 from scrapers.scraper_base import ScraperBase
-from scrapers.rental_offer import RentalOffer
-from time import time
-import requests
-from urllib.parse import urljoin
 
 
 class ScraperSreality(ScraperBase):
@@ -99,40 +96,72 @@ class ScraperSreality(ScraperBase):
 
 
     def _create_link_to_offer(self, offer) -> str:
-        return urljoin(self.base_url, "/detail" +
-            "/" + self._category_type_to_url[offer["seo"]["category_type_cb"]] +
-            "/" + self._category_main_to_url[offer["seo"]["category_main_cb"]] +
-            "/" + self._category_sub_to_url[offer["seo"]["category_sub_cb"]] +
-            "/" + offer["seo"]["locality"] +
-            "/" + str(offer["hash_id"]))
+        cat_type = self._category_type_to_url[offer["categoryTypeCb"]["value"]]
+        cat_main = self._category_main_to_url[offer["categoryMainCb"]["value"]]
+        cat_sub = self._category_sub_to_url.get(offer["categorySubCb"]["value"], "byt")
+
+        locality = offer["locality"]
+        parts = [locality.get("citySeoName"), locality.get("cityPartSeoName"), locality.get("streetSeoName")]
+        locality_str = "-".join(p for p in parts if p)
+
+        return urljoin(self.base_url, f"/detail/{cat_type}/{cat_main}/{cat_sub}/{locality_str}/{offer['id']}")
 
     def build_response(self) -> requests.Response:
-        url = self.base_url + "/api/cs/v2/estates?category_main_cb=1&category_sub_cb="
-        url += "|".join(self.get_dispositions_data())
-        url += "&category_type_cb=2&locality_district_id=72&locality_region_id=14&per_page=20"
-        url += "&tms=" + str(int(time()))
+        url = self.base_url + "/hledani/pronajem/byty/brno"
 
         logging.debug("Sreality request: %s", url)
 
         return requests.get(url, headers=self.headers)
 
     def get_latest_offers(self) -> list[RentalOffer]:
-        response = self.build_response().json()
+        response = self.build_response()
+
+        if response.status_code != 200:
+            logging.warning("Sreality: unexpected status %s", response.status_code)
+            return []
+
+        match = re.search(r'__NEXT_DATA__[^>]*>(.*?)</script>', response.text)
+        if not match:
+            logging.warning("Sreality: __NEXT_DATA__ not found in response")
+            return []
+
+        data = json.loads(match.group(1))
+        queries = data["props"]["pageProps"]["dehydratedState"]["queries"]
+
+        results = None
+        for q in queries:
+            qkey = q.get("queryKey", [])
+            if isinstance(qkey, list) and len(qkey) > 0 and qkey[0] == "estatesSearch":
+                results = q["state"]["data"]["results"]
+                break
+
+        if results is None:
+            logging.warning("Sreality: estatesSearch query not found in page data")
+            return []
+
+        desired_subs = set(self.get_dispositions_data())
 
         items: list[RentalOffer] = []
 
-        for item in response["_embedded"]["estates"]:
-            # Ignorovat "tip" nabídky, které úplně neodpovídají filtrům a mění se s každým vyhledáváním
-            if item["region_tip"] > 0:
+        for item in results:
+            if str(item["categorySubCb"]["value"]) not in desired_subs:
                 continue
 
+            image_url = ""
+            if item.get("images"):
+                image_url = "https:" + item["images"][0]["url"] + "?fl=res,800,600,3|shr,,20|jpg,80"
+
+            locality = item["locality"]
+            location_parts = [locality.get("city", ""), locality.get("cityPart", "")]
+            location = " - ".join(p for p in location_parts if p)
+
             items.append(RentalOffer(
-                scraper = self,
-                link = self._create_link_to_offer(item),
-                title = item["name"],
-                location = item["locality"],
-                price = item["price_czk"]["value_raw"],
-                image_url = item["_links"]["image_middle2"][0]["href"]
+                scraper=self,
+                link=self._create_link_to_offer(item),
+                title=item["name"],
+                location=location,
+                price=item["priceCzk"],
+                image_url=image_url
             ))
 
         return items
