@@ -53,8 +53,15 @@ async def get_channel_or_exit(channel_id: int, purpose: str) -> discord.TextChan
 async def on_ready():
     global channel, storage
 
+    # on_ready se volá i po každém znovupřipojení k Discord gateway (např. "session has been invalidated"),
+    # proto se inicializace provede jen jednou a při dalších voláních se pouze obnoví reference na kanály.
     dev_channel = await get_channel_or_exit(config.discord.dev_channel, "Dev")
     channel = await get_channel_or_exit(config.discord.offers_channel, "Offers")
+
+    if process_latest_offers.is_running():
+        logging.info("Reconnected to Discord, offers loop is already running")
+        return
+
     storage = OffersStorage(config.found_offers_file)
 
     if not config.debug:
